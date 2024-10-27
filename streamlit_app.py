@@ -162,7 +162,7 @@ class QdrantIndex:
         except Exception as e:
             st.error(f"Error adding documents to Qdrant Cloud: {str(e)}")
             raise
-          def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
+            def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
     """Extract PDF URLs from XML sitemap recursively"""
     pdf_urls = []
     
