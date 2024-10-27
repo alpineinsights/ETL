@@ -8,4 +8,4 @@ tqdm==4.66.2
 requests==2.31.0
 streamlit==1.32.2
 python-dotenv==1.0.0
-quadrant-client==0.2.1
+qdrant-client==1.7.0
