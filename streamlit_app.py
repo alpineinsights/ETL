@@ -11,6 +11,8 @@ from datetime import datetime
 import pickle
 from sklearn.feature_extraction.text import TfidfVectorizer
 import time
+from quadrant.client import QuadrantClient
+from quadrant.types import Vector, VectorSet
 
 # Initialize Streamlit page configuration
 st.set_page_config(
@@ -36,6 +38,11 @@ def check_dependencies():
         from llama_parse import LlamaParse
     except ImportError:
         missing_packages.append("llama-parse")
+        
+    try:
+        import quadrant
+    except ImportError:
+        missing_packages.append("quadrant-client")
     
     if missing_packages:
         st.error(f"""
@@ -59,67 +66,71 @@ class Document:
     company_name: str
 
 class QuadrantIndex:
-    """Vector store combining TF-IDF and dense vectors"""
-    def __init__(self, index_name: str):
+    """Vector store combining TF-IDF and dense vectors using Quadrant"""
+    def __init__(self, api_key: str, index_name: str):
         self.index_name = index_name
-        self.dense_vectors = []
+        self.client = QuadrantClient(api_key=api_key)
         self.tfidf_vectorizer = TfidfVectorizer(
             lowercase=True,
             strip_accents='unicode',
             ngram_range=(1, 2)
         )
         self.documents: List[Document] = []
-        self.sparse_matrix = None
+        
+        # Ensure collection exists
+        try:
+            self.client.get_collection(self.index_name)
+        except:
+            self.client.create_collection(
+                name=self.index_name,
+                dimension=768  # Voyage AI dimension
+            )
         
     def add_documents(self, docs: List[Document], dense_vectors: List[List[float]]):
-        """Add a batch of documents to both dense and sparse indices"""
-        # Update dense vectors
-        self.dense_vectors.extend(dense_vectors)
-        
+        """Add documents to Quadrant index"""
         # Update documents list
         self.documents.extend(docs)
         
-        # Recompute TF-IDF matrix for all documents
-        texts = [doc.text for doc in self.documents]
-        self.sparse_matrix = self.tfidf_vectorizer.fit_transform(texts)
+        # Compute sparse vectors
+        texts = [doc.text for doc in docs]
+        sparse_matrix = self.tfidf_vectorizer.fit_transform(texts)
+        
+        # Prepare vectors for Quadrant
+        vectors = []
+        for i, (doc, dense_vec) in enumerate(zip(docs, dense_vectors)):
+            sparse_vec = sparse_matrix[i].toarray()[0]
+            
+            # Create combined vector set
+            vector_set = VectorSet(
+                id=f"{self.index_name}-{len(self.documents)-len(docs)+i}",
+                dense=Vector(dense_vec),
+                sparse=Vector(sparse_vec.tolist()),
+                metadata={
+                    "text": doc.text,
+                    "context": doc.context,
+                    "url": doc.url,
+                    "date_processed": doc.date_processed,
+                    "company_name": doc.company_name
+                }
+            )
+            vectors.append(vector_set)
+        
+        # Upload to Quadrant in batches
+        batch_size = 100
+        for i in range(0, len(vectors), batch_size):
+            batch = vectors[i:i + batch_size]
+            self.client.upsert_vectors(
+                collection_name=self.index_name,
+                vectors=batch
+            )
 
     def save_to_session_state(self):
-        """Save index to Streamlit session state"""
+        """Save index metadata to session state"""
         st.session_state['index_data'] = {
             'name': self.index_name,
-            'dense_vectors': self.dense_vectors,
             'documents': self.documents,
-            'tfidf_vectorizer': pickle.dumps(self.tfidf_vectorizer),
-            'sparse_matrix': {
-                'data': self.sparse_matrix.data,
-                'indices': self.sparse_matrix.indices,
-                'indptr': self.sparse_matrix.indptr,
-                'shape': self.sparse_matrix.shape
-            } if self.sparse_matrix is not None else None
+            'tfidf_vectorizer': pickle.dumps(self.tfidf_vectorizer)
         }
-
-    @classmethod
-    def load_from_session_state(cls):
-        """Load index from Streamlit session state"""
-        if 'index_data' not in st.session_state:
-            return None
-        
-        data = st.session_state['index_data']
-        index = cls(data['name'])
-        index.dense_vectors = data['dense_vectors']
-        index.documents = data['documents']
-        index.tfidf_vectorizer = pickle.loads(data['tfidf_vectorizer'])
-        
-        if data['sparse_matrix']:
-            from scipy.sparse import csr_matrix
-            index.sparse_matrix = csr_matrix(
-                (data['sparse_matrix']['data'],
-                 data['sparse_matrix']['indices'],
-                 data['sparse_matrix']['indptr']),
-                shape=data['sparse_matrix']['shape']
-            )
-        
-        return index
 
 def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
     """Extract PDF URLs from XML sitemap recursively"""
@@ -274,41 +285,46 @@ def render_ui():
         st.session_state.api_keys = {
             'anthropic': '',
             'voyage': '',
-            'llamaparse': ''
+            'llamaparse': '',
+            'quadrant': ''
         }
     
     # API Configuration
     with st.expander("🔑 API Configuration", expanded=True):
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
             st.session_state.api_keys['anthropic'] = st.text_input(
                 "Anthropic API Key",
                 type="password",
                 value=st.session_state.api_keys['anthropic']
             )
-        with col2:
             st.session_state.api_keys['voyage'] = st.text_input(
                 "Voyage AI API Key",
                 type="password",
                 value=st.session_state.api_keys['voyage']
             )
-        with col3:
+        with col2:
             st.session_state.api_keys['llamaparse'] = st.text_input(
                 "LlamaParse API Key",
                 type="password",
                 value=st.session_state.api_keys['llamaparse']
+            )
+            st.session_state.api_keys['quadrant'] = st.text_input(
+                "Quadrant API Key",
+                type="password",
+                value=st.session_state.api_keys['quadrant']
             )
     
     # Processing Configuration
     with st.expander("⚙️ Processing Configuration", expanded=True):
         st.session_state.sitemap_url = st.text_input("XML Sitemap URL")
         st.session_state.company_name = st.text_input("Company Name")
-        st.session_state.index_name = st.text_input("Index Name", "hybrid_search")
         st.session_state.voyage_model = st.selectbox(
             "Voyage AI Model",
             options=["voyage-finance-2", "voyage-2"],
             index=0
         )
+        st.session_state.index_name = "hybrid_search_" + datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Process button
     if st.button("🚀 Start Processing"):
@@ -332,8 +348,11 @@ def render_ui():
                 'llama_parse': LlamaParse(api_key=st.session_state.api_keys['llamaparse'])
             }
             
-            # Initialize index
-            index = QuadrantIndex(st.session_state.index_name)
+            # Initialize Quadrant index
+            index = QuadrantIndex(
+                api_key=st.session_state.api_keys['quadrant'],
+                index_name=st.session_state.index_name
+            )
             
             # Get PDF URLs
             urls = get_urls_from_sitemap(st.session_state.sitemap_url)
@@ -348,9 +367,9 @@ def render_ui():
                 process_single_document(url, clients, index, st.session_state.company_name)
                 progress_bar.progress((i + 1) / len(urls))
             
-            # Save index to session state
+            # Save index metadata to session state
             index.save_to_session_state()
-            st.success("Processing complete!")
+            st.success(f"Processing complete! Index name: {st.session_state.index_name}")
             
         except Exception as e:
             st.error(f"Error during processing: {str(e)}")
