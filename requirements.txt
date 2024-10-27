@@ -1,3 +1,4 @@
+
 anthropic==0.8.1
 voyageai==0.1.4
 llama-parse==0.5.12
@@ -7,3 +8,4 @@ tqdm==4.66.2
 requests==2.31.0
 streamlit==1.32.2
 python-dotenv==1.0.0
+quadrant-client==0.2.1
