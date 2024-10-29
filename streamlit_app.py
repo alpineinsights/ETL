@@ -1,3 +1,5 @@
+# streamlit_app.py
+
 import streamlit as st
 import requests
 import xml.etree.ElementTree as ET
@@ -37,7 +39,7 @@ st.set_page_config(
 
 # Check for required API keys in Streamlit secrets
 required_api_keys = ['ANTHROPIC_API_KEY', 'VOYAGE_API_KEY', 'LLAMA_PARSE_API_KEY', 'QDRANT_API_KEY']
-missing_keys = [key for key in required_api_keys if key not in st.secrets]
+missing_keys = [key for key not in st.secrets for key in required_api_keys]
 if missing_keys:
     st.error(f"""
         Missing required API keys in Streamlit secrets:
@@ -50,7 +52,7 @@ if missing_keys:
 def check_dependencies():
     missing_packages = []
     try:
-        import anthropic
+        from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
     except ImportError:
         missing_packages.append("anthropic")
     try:
@@ -73,10 +75,10 @@ def check_dependencies():
             Please check your requirements.txt file.
         """)
         st.stop()
-    return anthropic, Client, LlamaParse, QdrantClient, models, UnexpectedResponse
+    return Anthropic, Client, LlamaParse, QdrantClient, models, UnexpectedResponse
 
 # Check dependencies before proceeding
-anthropic, VoyageClient, LlamaParse, QdrantClient, qdrant_models, UnexpectedResponse = check_dependencies()
+AnthropicClient, VoyageClient, LlamaParse, QdrantClient, qdrant_models, UnexpectedResponse = check_dependencies()
 
 @dataclass
 class Document:
@@ -221,14 +223,14 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     return chunks
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def get_document_context(client: anthropic.Client, content: str, prompt: str, model: str) -> str:
+def get_document_context(client: AnthropicClient, content: str, prompt: str, model: str) -> str:
     """Generate context for a document chunk using Claude with retry mechanism"""
     try:
         response = client.completions.create(
             model=model,
             max_tokens_to_sample=200,
             temperature=0,
-            prompt=f"\n\nHuman: {prompt}\n\nDocument Content:\n{content}\n\nAssistant:"
+            prompt=f"{HUMAN_PROMPT} {prompt}\n\nDocument Content:\n{content}{AI_PROMPT}"
         )
         return response.completion.strip()
     except Exception as e:
@@ -291,7 +293,7 @@ def render_ui():
     st.title("📚 Document Processing Pipeline")
 
     with st.expander("⚙️ Configuration", expanded=True):
-        st.session_state.sitemap_url = st.text_input("XML Sitemap URL")
+        st.session_state['sitemap_url'] = st.text_input("XML Sitemap URL")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -318,7 +320,7 @@ def render_ui():
             config.update({
                 'context_model': st.selectbox(
                     "Context Model",
-                    options=["claude-2", "claude-instant"],
+                    options=["claude-2", "claude-instant-1"],  # Update model names accordingly
                     index=0
                 ),
                 'qdrant_cluster': st.text_input(
@@ -342,7 +344,7 @@ def render_ui():
         )
 
     if st.button("🚀 Start Processing"):
-        if not st.session_state.sitemap_url:
+        if not st.session_state['sitemap_url']:
             st.error("Please provide a sitemap URL")
             return
 
@@ -353,7 +355,7 @@ def render_ui():
         try:
             # Initialize clients using Streamlit secrets
             clients = {
-                'anthropic': anthropic.Client(api_key=st.secrets['ANTHROPIC_API_KEY']),
+                'anthropic': AnthropicClient(api_key=st.secrets['ANTHROPIC_API_KEY']),
                 'voyage': VoyageClient(api_key=st.secrets['VOYAGE_API_KEY']),
                 'llama_parse': LlamaParse(api_key=st.secrets['LLAMA_PARSE_API_KEY'])
             }
@@ -365,7 +367,7 @@ def render_ui():
                 index_name=config['index_name']
             )
 
-            urls = get_urls_from_sitemap(st.session_state.sitemap_url)
+            urls = get_urls_from_sitemap(st.session_state['sitemap_url'])
             if not urls:
                 st.error("No PDF URLs found in the sitemap")
                 return
