@@ -51,9 +51,9 @@ def check_dependencies():
         missing_packages.append("anthropic")
     
     try:
-        from voyageai import Client
+        from voyage_ai import Client  # Changed from voyageai to voyage_ai
     except ImportError:
-        missing_packages.append("voyageai")
+        missing_packages.append("voyage-ai")
         
     try:
         from llama_parse import LlamaParse
