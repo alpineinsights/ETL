@@ -15,6 +15,10 @@ from sklearn.feature_extraction.text import HashingVectorizer
 from tenacity import retry, stop_after_attempt, wait_exponential
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from ratelimit import limits, sleep_and_retry
+from python_dateutil import parser
+import psutil
+from urllib.parse import urlparse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -185,10 +189,30 @@ class QdrantIndex:
             logger.exception("Exception occurred while adding documents to Qdrant")
             raise
 
+def is_valid_url(url: str) -> bool:
+    """Validate URL format"""
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except:
+        return False
+
+def check_memory_usage():
+    """Monitor memory usage and warn if too high"""
+    memory_percent = psutil.Process().memory_percent()
+    if memory_percent > 80:
+        st.warning(f"High memory usage detected: {memory_percent:.1f}%")
+        logger.warning(f"High memory usage: {memory_percent:.1f}%")
+        return True
+    return False
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
     """Extract PDF URLs from XML sitemap recursively"""
-    pdf_urls = []
+    if not is_valid_url(sitemap_url):
+        raise ValueError("Invalid sitemap URL format")
 
+    pdf_urls = []
     try:
         response = requests.get(sitemap_url, timeout=30)
         response.raise_for_status()
@@ -204,6 +228,12 @@ def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
             urls = root.findall('.//ns:url/ns:loc', namespaces)
             pdf_urls.extend([url.text for url in urls if url.text.lower().endswith('.pdf')])
 
+    except requests.Timeout:
+        st.error(f"Timeout while fetching sitemap: {sitemap_url}")
+        logger.error(f"Timeout while fetching sitemap: {sitemap_url}")
+    except requests.RequestException as e:
+        st.error(f"Network error processing sitemap {sitemap_url}: {str(e)}")
+        logger.error(f"Network error processing sitemap {sitemap_url}: {str(e)}")
     except Exception as e:
         st.error(f"Error processing sitemap {sitemap_url}: {str(e)}")
         logger.exception(f"Exception occurred while processing sitemap {sitemap_url}")
@@ -222,6 +252,8 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
         i += chunk_size - overlap
     return chunks
 
+@sleep_and_retry
+@limits(calls=50, period=60)  # 50 calls per minute
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_document_context(client: AnthropicClient, content: str, prompt: str, model: str) -> str:
     """Generate context for a document chunk using Claude with retry mechanism"""
