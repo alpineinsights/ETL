@@ -12,17 +12,6 @@ import pickle
 from sklearn.feature_extraction.text import TfidfVectorizer
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
-
-# Get API keys from environment
-ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
-VOYAGE_API_KEY = os.getenv('VOYAGE_API_KEY')
-LLAMA_PARSE_API_KEY = os.getenv('LLAMA_PARSE_API_KEY')
-QDRANT_API_KEY = os.getenv('QDRANT_API_KEY')
-QDRANT_URL = os.getenv('QDRANT_URL')
 
 # Default context prompt
 DEFAULT_CONTEXT_PROMPT = """
@@ -41,15 +30,15 @@ st.set_page_config(
     layout="wide"
 )
 
-# Check for required environment variables
-if not all([ANTHROPIC_API_KEY, VOYAGE_API_KEY, LLAMA_PARSE_API_KEY, QDRANT_API_KEY, QDRANT_URL]):
+# Check for required API keys in Streamlit secrets
+if not all(key in st.secrets for key in ['ANTHROPIC_API_KEY', 'VOYAGE_API_KEY', 'LLAMA_PARSE_API_KEY', 'QDRANT_API_KEY']):
     st.error("""
-        Missing required environment variables. Please ensure you have set:
+        Missing required API keys in Streamlit secrets.
+        Please add the following in your Streamlit Cloud dashboard under Settings -> Secrets:
         - ANTHROPIC_API_KEY
         - VOYAGE_API_KEY
         - LLAMA_PARSE_API_KEY
         - QDRANT_API_KEY
-        - QDRANT_URL
     """)
     st.stop()
 
@@ -315,59 +304,73 @@ def render_ui():
     st.title("📚 Document Processing Pipeline")
     
     with st.expander("⚙️ Configuration", expanded=True):
-        config = {
-            'embedding_model': st.selectbox(
-                "Embedding Model",
-                options=["voyage-finance-2", "voyage-2"],
-                index=0
-            ),
-            'chunk_size': st.number_input(
-                "Chunk Size",
-                value=1024,
-                min_value=100,
-                max_value=8192
-            ),
-            'chunk_overlap': st.number_input(
-                "Chunk Overlap",
-                value=200,
-                min_value=0,
-                max_value=1000
-            ),
-            'context_model': st.selectbox(
-                "Context Model",
-                options=["claude-3-haiku-20240307", "claude-3-sonnet-20240229"],
-                index=0
-            ),
-            'context_prompt': st.text_area(
-                "Context Prompt",
-                value=DEFAULT_CONTEXT_PROMPT,
-                height=200
-            ),
-            'qdrant_cluster': st.text_input(
-                "Qdrant Cluster",
-                value=QDRANT_URL,
-                disabled=True
-            )
-        }
-        
         st.session_state.sitemap_url = st.text_input("XML Sitemap URL")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            config = {
+                'embedding_model': st.selectbox(
+                    "Embedding Model",
+                    options=["voyage-finance-2", "voyage-2"],
+                    index=0
+                ),
+                'chunk_size': st.number_input(
+                    "Chunk Size",
+                    value=1024,
+                    min_value=100,
+                    max_value=8192
+                ),
+                'chunk_overlap': st.number_input(
+                    "Chunk Overlap",
+                    value=200,
+                    min_value=0,
+                    max_value=1000
+                )
+            }
+        with col2:
+            config.update({
+                'context_model': st.selectbox(
+                    "Context Model",
+                    options=["claude-3-haiku-20240307", "claude-3-sonnet-20240229"],
+                    index=0
+                ),
+                'qdrant_cluster': st.text_input(
+                    "Qdrant Cluster URL",
+                    value=st.session_state.get('qdrant_url', ''),
+                    help="Format: https://your-cluster-name.qdrant.tech",
+                    placeholder="https://your-cluster-name.qdrant.tech"
+                )
+            })
+        
+        config['context_prompt'] = st.text_area(
+            "Context Prompt",
+            value=DEFAULT_CONTEXT_PROMPT,
+            height=200
+        )
+        
         st.session_state.index_name = f"hybrid_search_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
     if st.button("🚀 Start Processing"):
         if not st.session_state.sitemap_url:
             st.error("Please provide a sitemap URL")
             return
+            
+        if not config['qdrant_cluster']:
+            st.error("Please provide the Qdrant Cluster URL")
+            return
         
         try:
+            # Initialize clients using Streamlit secrets
             clients = {
-                'anthropic': anthropic.Anthropic(api_key=ANTHROPIC_API_KEY),
-                'voyage': VoyageClient(api_key=VOYAGE_API_KEY),
-                'llama_parse': LlamaParse(api_key=LLAMA_PARSE_API_KEY)
+                'anthropic': anthropic.Anthropic(api_key=st.secrets['ANTHROPIC_API_KEY']),
+                'voyage': VoyageClient(api_key=st.secrets['VOYAGE_API_KEY']),
+                'llama_parse': LlamaParse(api_key=st.secrets['LLAMA_PARSE_API_KEY'])
             }
             
+            # Initialize Qdrant index
             index = QdrantIndex(
-                url=QDRANT_URL,
-                api_key=QDRANT_API_KEY,
+                url=config['qdrant_cluster'],
+                api_key=st.secrets['QDRANT_API_KEY'],
                 index_name=st.session_state.index_name
             )
             
