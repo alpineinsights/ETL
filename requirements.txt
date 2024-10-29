@@ -7,3 +7,6 @@ anthropic
 voyage-ai
 llama-parse
 qdrant-client==1.4.0
+ratelimit==2.2.1
+python-dateutil==2.8.2
+psutil==5.9.5
