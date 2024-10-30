@@ -13,6 +13,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+# New imports for LlamaIndex
+from llama_index.core import SimpleDirectoryReader, Document as LlamaDocument
+from llama_index.core.node_parser import SimpleNodeParser
+from llama_index.embeddings import VoyageEmbedding
+from llama_index.core import download_loader
+
 # Default context prompt
 DEFAULT_CONTEXT_PROMPT = """
 Please analyze this document chunk and provide a brief contextual summary that includes:
@@ -31,41 +37,50 @@ st.set_page_config(
 )
 
 # Check for required API keys in Streamlit secrets
-if not all(key in st.secrets for key in ['ANTHROPIC_API_KEY', 'VOYAGE_API_KEY', 'LLAMA_PARSE_API_KEY', 'QDRANT_API_KEY']):
-    st.error("""
+REQUIRED_KEYS = ['ANTHROPIC_API_KEY', 'VOYAGE_API_KEY', 'LLAMA_PARSE_API_KEY', 'QDRANT_API_KEY']
+if not all(key in st.secrets for key in REQUIRED_KEYS):
+    st.error(f"""
         Missing required API keys in Streamlit secrets.
         Please add the following in your Streamlit Cloud dashboard under Settings -> Secrets:
-        - ANTHROPIC_API_KEY
-        - VOYAGE_API_KEY
-        - LLAMA_PARSE_API_KEY
-        - QDRANT_API_KEY
+        {', '.join(REQUIRED_KEYS)}
     """)
     st.stop()
 
 # Add dependencies check
 def check_dependencies():
-    missing_packages = []
-    try:
-        import anthropic
-    except ImportError:
-        missing_packages.append("anthropic")
+    required_packages = {
+        'anthropic': 'anthropic',
+        'voyageai': 'voyageai',
+        'llama_parse': 'llama-parse',
+        'llama_index': 'llama-index-core',
+        'qdrant_client': 'qdrant-client'
+    }
     
-    try:
-        from voyageai import Client  
-    except ImportError:
-        missing_packages.append("voyageai")
-        
-    try:
-        from llama_parse import LlamaParse
-    except ImportError:
-        missing_packages.append("llama-parse")
-        
-    try:
-        from qdrant_client import QdrantClient
-        from qdrant_client.http import models
-        from qdrant_client.http.exceptions import UnexpectedResponse
-    except ImportError:
-        missing_packages.append("qdrant-client")
+    missing_packages = []
+    modules = {}
+    
+    for module_name, package_name in required_packages.items():
+        try:
+            if module_name == 'anthropic':
+                import anthropic
+                modules['anthropic'] = anthropic
+            elif module_name == 'voyageai':
+                from voyageai import Client
+                modules['VoyageClient'] = Client
+            elif module_name == 'llama_parse':
+                from llama_parse import LlamaParse
+                modules['LlamaParse'] = LlamaParse
+            elif module_name == 'qdrant_client':
+                from qdrant_client import QdrantClient
+                from qdrant_client.http import models
+                from qdrant_client.http.exceptions import UnexpectedResponse
+                modules.update({
+                    'QdrantClient': QdrantClient,
+                    'qdrant_models': models,
+                    'UnexpectedResponse': UnexpectedResponse
+                })
+        except ImportError:
+            missing_packages.append(package_name)
     
     if missing_packages:
         st.error(f"""
@@ -74,10 +89,11 @@ def check_dependencies():
         """)
         st.stop()
     
-    return anthropic, Client, LlamaParse, QdrantClient, models, UnexpectedResponse
+    return modules
 
 # Check dependencies before proceeding
-anthropic, VoyageClient, LlamaParse, QdrantClient, qdrant_models, UnexpectedResponse = check_dependencies()
+modules = check_dependencies()
+globals().update(modules)
 
 @dataclass
 class Document:
@@ -140,7 +156,7 @@ class QdrantIndex:
         except Exception as e:
             st.error(f"Error initializing Qdrant collection: {str(e)}")
             raise
-    
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def add_documents(self, docs: List[Document], dense_vectors: List[List[float]]):
         """Add documents to Qdrant Cloud with retry mechanism"""
@@ -208,38 +224,31 @@ def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
     
     return pdf_urls
 
-def chunk_markdown(text: str, chunk_size: int, overlap: int) -> List[str]:
-    """Chunk markdown text while preserving structure"""
-    chunks = []
-    lines = text.split('\n')
-    current_chunk = []
-    current_length = 0
-    
-    for line in lines:
-        line_length = len(line)
-        if current_length + line_length > chunk_size and current_chunk:
-            chunks.append('\n'.join(current_chunk))
-            overlap_text = current_chunk[-2:] if len(current_chunk) > 2 else current_chunk
-            current_chunk = overlap_text
-            current_length = sum(len(line) for line in current_chunk)
-        
-        current_chunk.append(line)
-        current_length += line_length
-    
-    if current_chunk:
-        chunks.append('\n'.join(current_chunk))
-    
-    return chunks
-
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_document_context(client: anthropic.Anthropic, content: str, prompt: str, model: str) -> str:
-    """Generate context for a document chunk using Claude with retry mechanism"""
+    """Generate context for a document chunk using Claude with prompt caching"""
     try:
-        response = client.messages.create(
+        response = client.beta.prompt_caching.messages.create(
             model=model,
             max_tokens=200,
             temperature=0,
-            messages=[{"role": "user", "content": prompt + "\n\nDocument Content:\n" + content}]
+            messages=[
+                {
+                    "role": "user", 
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt,
+                            "cache_control": {"type": "ephemeral"}
+                        },
+                        {
+                            "type": "text",
+                            "text": "\n\nDocument Content:\n" + content
+                        }
+                    ]
+                }
+            ],
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
         )
         return response.content[0].text
     except Exception as e:
@@ -247,25 +256,45 @@ def get_document_context(client: anthropic.Anthropic, content: str, prompt: str,
         return ""
 
 def process_single_document(url: str, clients: Dict, index: QdrantIndex, config: Dict):
-    """Process a single document URL with improved error handling"""
+    """Process a single document using LlamaIndex components"""
     try:
+        # Download PDF
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
             tmp_file.write(response.content)
             tmp_path = tmp_file.name
-        
-        try:
-            parsed_docs = clients['llama_parse'].load_data(tmp_path)
             
-            for doc in parsed_docs:
-                chunks = chunk_markdown(doc.text, config['chunk_size'], config['chunk_overlap'])
-                documents = []
-                dense_vectors = []
-                
-                with st.progress(0) as chunk_progress:
+        try:
+            # Load and parse document
+            PDFReader = download_loader("PDFReader")
+            loader = PDFReader()
+            raw_docs = loader.load_data(tmp_path)
+            
+            # Set up components
+            parser = SimpleNodeParser.from_defaults(
+                chunk_size=config['chunk_size'],
+                chunk_overlap=config['chunk_overlap']
+            )
+            
+            embed_model = VoyageEmbedding(
+                api_key=st.secrets['VOYAGE_API_KEY'],
+                model_name=config['embedding_model']
+            )
+            
+            documents = []
+            dense_vectors = []
+            
+            with st.progress(0) as chunk_progress:
+                # Process each document
+                for doc in raw_docs:
+                    # Split into chunks
+                    nodes = parser.get_nodes_from_documents([doc])
+                    chunks = [node.text for node in nodes]
+                    
                     for i, chunk in enumerate(chunks):
+                        # Get context
                         context = get_document_context(
                             clients['anthropic'],
                             chunk,
@@ -273,29 +302,29 @@ def process_single_document(url: str, clients: Dict, index: QdrantIndex, config:
                             config['context_model']
                         )
                         
-                        doc = Document(
+                        # Create document
+                        processed_doc = Document(
                             text=chunk,
                             context=context,
                             url=url,
                             date_processed=datetime.now().isoformat()
                         )
-                        documents.append(doc)
+                        documents.append(processed_doc)
                         
-                        vector = clients['voyage'].embed(
-                            [chunk],
-                            model=config['embedding_model']
-                        )[0]
+                        # Get embedding
+                        vector = embed_model.get_text_embedding(chunk)
                         dense_vectors.append(vector)
                         
                         chunk_progress.progress((i + 1) / len(chunks))
                         time.sleep(0.1)
-                
+                    
+                # Add to index
                 index.add_documents(documents, dense_vectors)
-        
+                
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
-            
+                
     except Exception as e:
         st.error(f"Error processing {url}: {str(e)}")
 
@@ -360,13 +389,14 @@ def render_ui():
             return
         
         try:
-            # Initialize clients using Streamlit secrets
+            # Initialize clients
             clients = {
                 'anthropic': anthropic.Anthropic(api_key=st.secrets['ANTHROPIC_API_KEY']),
                 'voyage': VoyageClient(api_key=st.secrets['VOYAGE_API_KEY']),
                 'llama_parse': LlamaParse(api_key=st.secrets['LLAMA_PARSE_API_KEY'])
             }
             
+            # Initialize Qdrant index
             # Initialize Qdrant index
             index = QdrantIndex(
                 url=config['qdrant_cluster'],
@@ -381,15 +411,45 @@ def render_ui():
                 
             st.info(f"Found {len(urls)} PDF documents")
             
+            # Cache status metrics
+            cache_metrics = {
+                'total_input_tokens': 0,
+                'cache_read_tokens': 0,
+                'cache_saved_cost': 0
+            }
+            
             overall_progress = st.progress(0)
             status_text = st.empty()
+            metrics_text = st.empty()
             
             for i, url in enumerate(urls):
                 status_text.text(f"Processing document {i+1}/{len(urls)}: {url}")
                 process_single_document(url, clients, index, config)
                 overall_progress.progress((i + 1) / len(urls))
+                
+                # Update and display cache metrics
+                if hasattr(clients['anthropic'], 'last_response_metrics'):
+                    metrics = clients['anthropic'].last_response_metrics
+                    cache_metrics['total_input_tokens'] += metrics.get('input_tokens', 0)
+                    cache_metrics['cache_read_tokens'] += metrics.get('cache_read_tokens', 0)
+                    
+                    # Calculate approximate cost savings (assuming $0.01 per 1K tokens)
+                    saved_tokens = cache_metrics['cache_read_tokens'] * 0.9  # 90% discount on cached tokens
+                    cache_metrics['cache_saved_cost'] = (saved_tokens / 1000) * 0.01
+                    
+                    metrics_text.text(
+                        f"Cache Statistics:\n"
+                        f"Total Input Tokens: {cache_metrics['total_input_tokens']}\n"
+                        f"Cached Tokens Used: {cache_metrics['cache_read_tokens']}\n"
+                        f"Estimated Cost Savings: ${cache_metrics['cache_saved_cost']:.2f}"
+                    )
             
-            st.success(f"Processing complete! Index name: {st.session_state.index_name}")
+            st.success(f"""
+                Processing complete! 
+                Index name: {st.session_state.index_name}
+                Total documents processed: {len(urls)}
+                Total cost savings from caching: ${cache_metrics['cache_saved_cost']:.2f}
+            """)
             
         except Exception as e:
             st.error(f"Error during processing: {str(e)}")
@@ -400,5 +460,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
