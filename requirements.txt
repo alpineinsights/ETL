@@ -8,4 +8,4 @@ streamlit==1.32.2
 qdrant-client==1.7.0
 tenacity==8.2.3
 llama-index-core>=0.10.0
-llama-index-embeddings>=0.1.0
+llama-index-embeddings-voyage>=0.1.0
