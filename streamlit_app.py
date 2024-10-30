@@ -12,12 +12,7 @@ import pickle
 from sklearn.feature_extraction.text import TfidfVectorizer
 import time
 from tenacity import retry, stop_after_attempt, wait_exponential
-
-# New imports for LlamaIndex
-from llama_index.core import SimpleDirectoryReader, Document as LlamaDocument
-from llama_index.core.node_parser import SimpleNodeParser
-from llama_index.embeddings import VoyageEmbedding
-from llama_index.core import download_loader
+from llama_index.embeddings.voyageai import VoyageEmbedding
 
 # Default context prompt
 DEFAULT_CONTEXT_PROMPT = """
@@ -52,7 +47,6 @@ def check_dependencies():
         'anthropic': 'anthropic',
         'voyageai': 'voyageai',
         'llama_parse': 'llama-parse',
-        'llama_index': 'llama-index-core',
         'qdrant_client': 'qdrant-client'
     }
     
@@ -156,8 +150,8 @@ class QdrantIndex:
         except Exception as e:
             st.error(f"Error initializing Qdrant collection: {str(e)}")
             raise
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    
+    @retry(stop=stop_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=10000)
     def add_documents(self, docs: List[Document], dense_vectors: List[List[float]]):
         """Add documents to Qdrant Cloud with retry mechanism"""
         try:
@@ -224,6 +218,29 @@ def get_urls_from_sitemap(sitemap_url: str) -> List[str]:
     
     return pdf_urls
 
+def chunk_markdown(text: str, chunk_size: int, overlap: int) -> List[str]:
+    """Chunk markdown text while preserving structure"""
+    chunks = []
+    lines = text.split('\n')
+    current_chunk = []
+    current_length = 0
+    
+    for line in lines:
+        line_length = len(line)
+        if current_length + line_length > chunk_size and current_chunk:
+            chunks.append('\n'.join(current_chunk))
+            overlap_text = current_chunk[-2:] if len(current_chunk) > 2 else current_chunk
+            current_chunk = overlap_text
+            current_length = sum(len(line) for line in current_chunk)
+        
+        current_chunk.append(line)
+        current_length += line_length
+    
+    if current_chunk:
+        chunks.append('\n'.join(current_chunk))
+    
+    return chunks
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_document_context(client: anthropic.Anthropic, content: str, prompt: str, model: str) -> str:
     """Generate context for a document chunk using Claude with prompt caching"""
@@ -255,10 +272,17 @@ def get_document_context(client: anthropic.Anthropic, content: str, prompt: str,
         st.error(f"Error generating context: {str(e)}")
         return ""
 
+def get_embedding_model(config: Dict) -> VoyageEmbedding:
+    """Initialize Voyage embedding model through LlamaIndex"""
+    return VoyageEmbedding(
+        model_name=config['embedding_model'],
+        voyage_api_key=st.secrets['VOYAGE_API_KEY']
+    )
+
 def process_single_document(url: str, clients: Dict, index: QdrantIndex, config: Dict):
     """Process a single document using LlamaIndex components"""
     try:
-        # Download PDF
+        # Download document
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         
@@ -267,32 +291,18 @@ def process_single_document(url: str, clients: Dict, index: QdrantIndex, config:
             tmp_path = tmp_file.name
             
         try:
-            # Load and parse document
-            PDFReader = download_loader("PDFReader")
-            loader = PDFReader()
-            raw_docs = loader.load_data(tmp_path)
+            # Parse document
+            parsed_docs = clients['llama_parse'].load_data(tmp_path)
             
-            # Set up components
-            parser = SimpleNodeParser.from_defaults(
-                chunk_size=config['chunk_size'],
-                chunk_overlap=config['chunk_overlap']
-            )
+            # Initialize embedding model
+            embed_model = get_embedding_model(config)
             
-            embed_model = VoyageEmbedding(
-                api_key=st.secrets['VOYAGE_API_KEY'],
-                model_name=config['embedding_model']
-            )
-            
-            documents = []
-            dense_vectors = []
-            
-            with st.progress(0) as chunk_progress:
-                # Process each document
-                for doc in raw_docs:
-                    # Split into chunks
-                    nodes = parser.get_nodes_from_documents([doc])
-                    chunks = [node.text for node in nodes]
-                    
+            for doc in parsed_docs:
+                chunks = chunk_markdown(doc.text, config['chunk_size'], config['chunk_overlap'])
+                documents = []
+                dense_vectors = []
+                
+                with st.progress(0) as chunk_progress:
                     for i, chunk in enumerate(chunks):
                         # Get context
                         context = get_document_context(
@@ -303,21 +313,19 @@ def process_single_document(url: str, clients: Dict, index: QdrantIndex, config:
                         )
                         
                         # Create document
-                        processed_doc = Document(
+                        documents.append(Document(
                             text=chunk,
                             context=context,
                             url=url,
                             date_processed=datetime.now().isoformat()
-                        )
-                        documents.append(processed_doc)
+                        ))
                         
-                        # Get embedding
+                        # Get embedding using LlamaIndex
                         vector = embed_model.get_text_embedding(chunk)
                         dense_vectors.append(vector)
                         
                         chunk_progress.progress((i + 1) / len(chunks))
-                        time.sleep(0.1)
-                    
+                
                 # Add to index
                 index.add_documents(documents, dense_vectors)
                 
@@ -397,7 +405,6 @@ def render_ui():
             }
             
             # Initialize Qdrant index
-            # Initialize Qdrant index
             index = QdrantIndex(
                 url=config['qdrant_cluster'],
                 api_key=st.secrets['QDRANT_API_KEY'],
@@ -412,43 +419,53 @@ def render_ui():
             st.info(f"Found {len(urls)} PDF documents")
             
             # Cache status metrics
-            cache_metrics = {
-                'total_input_tokens': 0,
-                'cache_read_tokens': 0,
-                'cache_saved_cost': 0
+            metrics = {
+                'total_documents': len(urls),
+                'processed_documents': 0,
+                'total_chunks': 0,
+                'failed_documents': 0,
+                'start_time': datetime.now()
             }
             
+            # Create placeholders for dynamic updates
             overall_progress = st.progress(0)
             status_text = st.empty()
-            metrics_text = st.empty()
+            metrics_container = st.container()
             
             for i, url in enumerate(urls):
-                status_text.text(f"Processing document {i+1}/{len(urls)}: {url}")
-                process_single_document(url, clients, index, config)
+                try:
+                    status_text.text(f"Processing document {i+1}/{len(urls)}: {url}")
+                    process_single_document(url, clients, index, config)
+                    metrics['processed_documents'] += 1
+                except Exception as e:
+                    metrics['failed_documents'] += 1
+                    st.error(f"Error processing document {url}: {str(e)}")
+                
+                # Update progress
                 overall_progress.progress((i + 1) / len(urls))
                 
-                # Update and display cache metrics
-                if hasattr(clients['anthropic'], 'last_response_metrics'):
-                    metrics = clients['anthropic'].last_response_metrics
-                    cache_metrics['total_input_tokens'] += metrics.get('input_tokens', 0)
-                    cache_metrics['cache_read_tokens'] += metrics.get('cache_read_tokens', 0)
-                    
-                    # Calculate approximate cost savings (assuming $0.01 per 1K tokens)
-                    saved_tokens = cache_metrics['cache_read_tokens'] * 0.9  # 90% discount on cached tokens
-                    cache_metrics['cache_saved_cost'] = (saved_tokens / 1000) * 0.01
-                    
-                    metrics_text.text(
-                        f"Cache Statistics:\n"
-                        f"Total Input Tokens: {cache_metrics['total_input_tokens']}\n"
-                        f"Cached Tokens Used: {cache_metrics['cache_read_tokens']}\n"
-                        f"Estimated Cost Savings: ${cache_metrics['cache_saved_cost']:.2f}"
-                    )
+                # Calculate and display metrics
+                elapsed_time = (datetime.now() - metrics['start_time']).total_seconds()
+                docs_per_second = metrics['processed_documents'] / elapsed_time if elapsed_time > 0 else 0
+                
+                with metrics_container:
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Processed Documents", metrics['processed_documents'])
+                    with col2:
+                        st.metric("Failed Documents", metrics['failed_documents'])
+                    with col3:
+                        st.metric("Processing Rate", f"{docs_per_second:.2f} docs/sec")
             
+            # Display final summary
+            processing_time = (datetime.now() - metrics['start_time']).total_seconds()
             st.success(f"""
                 Processing complete! 
-                Index name: {st.session_state.index_name}
-                Total documents processed: {len(urls)}
-                Total cost savings from caching: ${cache_metrics['cache_saved_cost']:.2f}
+                - Index name: {st.session_state.index_name}
+                - Total documents processed: {metrics['processed_documents']}
+                - Failed documents: {metrics['failed_documents']}
+                - Total processing time: {processing_time:.2f} seconds
+                - Average processing rate: {metrics['processed_documents']/processing_time:.2f} docs/sec
             """)
             
         except Exception as e:
@@ -460,3 +477,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+Version 2 of 2
+
+
+
+
